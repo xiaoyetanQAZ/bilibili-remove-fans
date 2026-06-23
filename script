@@ -1,0 +1,161 @@
+var cleaner = {
+    csrf: null,
+    mid: null,
+    wbiImgKey: null,
+    wbiSubKey: null,
+    running: false,
+    removed: 0
+};
+
+function log(msg) {
+    console.log("[粉丝清理] " + msg);
+}
+
+function sleep(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+function getCookie(name) {
+    var value = "; " + document.cookie;
+    var parts = value.split("; " + name + "=");
+    if (parts.length === 2) return parts.pop().split(";").shift();
+    return null;
+}
+
+function md5(msg) {
+    // 简化版md5（保持必要功能）
+    var buffer = new TextEncoder().encode(msg);
+    var n = buffer.length;
+    var words = new Uint32Array((n + 8 >> 6) + 1 << 4);
+    for (var i = 0; i < n; i++) words[i >> 2] |= buffer[i] << i % 4 * 8;
+    words[n >> 2] |= 128 << n % 4 * 8;
+    words[words.length - 2] = n * 8;
+    var a = 1732584193, b = 4023233417, c = 2562383102, d = 271733878;
+    var K = new Uint32Array(64);
+    for (var i = 0; i < 64; i++) K[i] = Math.abs(Math.sin(i + 1)) * 4294967296 >>> 0;
+    var S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+    function rotl(x, n) { return x << n | x >>> 32 - n; }
+    for (var i = 0; i < words.length; i += 16) {
+        var A = a, B = b, C = c, D = d;
+        for (var j = 0; j < 64; j++) {
+            var f, g;
+            if (j < 16) { f = B & C | ~B & D; g = j; }
+            else if (j < 32) { f = D & B | ~D & C; g = (5 * j + 1) % 16; }
+            else if (j < 48) { f = B ^ C ^ D; g = (3 * j + 5) % 16; }
+            else { f = C ^ (B | ~D); g = 7 * j % 16; }
+            var temp = D;
+            D = C; C = B;
+            var x = A + f + K[j] + words[i + g] | 0;
+            B = B + rotl(x, S[j]) | 0;
+            A = temp;
+        }
+        a = a + A | 0; b = b + B | 0; c = c + C | 0; d = d + D | 0;
+    }
+    var out = new ArrayBuffer(16);
+    var view = new DataView(out);
+    [a,b,c,d].forEach(function(val, i) { view.setUint32(i*4, val, true); });
+    return Array.from(new Uint8Array(out)).map(function(b) {
+        return b.toString(16).padStart(2, "0");
+    }).join("");
+}
+
+function getWbiKeys() {
+    return fetch("https://api.bilibili.com/x/web-interface/nav", {credentials: "include"})
+        .then(function(r) { return r.json(); })
+        .then(function(json) {
+            var img = json.data.wbi_img.img_url;
+            var sub = json.data.wbi_img.sub_url;
+            cleaner.wbiImgKey = img.slice(img.lastIndexOf("/") + 1, img.lastIndexOf("."));
+            cleaner.wbiSubKey = sub.slice(sub.lastIndexOf("/") + 1, sub.lastIndexOf("."));
+            log("WBI密钥获取成功");
+        });
+}
+
+function encWbi(params) {
+    var mixinKey = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
+        .map(function(i) { return (cleaner.wbiImgKey + cleaner.wbiSubKey)[i]; }).join("").slice(0,32);
+    
+    var ts = Math.round(Date.now() / 1000);
+    var allParams = Object.assign({}, params, {wts: ts});
+    var keys = Object.keys(allParams).sort();
+    var query = keys.map(function(k) {
+        return encodeURIComponent(k) + "=" + encodeURIComponent(allParams[k]);
+    }).join("&");
+    return query + "&w_rid=" + md5(query + mixinKey);
+}
+
+async function startCleaning(maxCount) {
+    if (cleaner.running) {
+        log("已经在运行中，请等待或刷新页面");
+        return;
+    }
+    
+    cleaner.csrf = getCookie("bili_jct");
+    cleaner.mid = location.pathname.match(/\/(\d+)/)[1];
+    cleaner.removed = 0;
+    cleaner.running = true;
+    
+    if (!cleaner.csrf || !cleaner.mid) {
+        log("错误：未登录或不在自己的粉丝页面！");
+        cleaner.running = false;
+        return;
+    }
+    
+    if (!cleaner.wbiImgKey) await getWbiKeys();
+    
+    log("开始清理非互粉，最大数量：" + (maxCount || 20));
+    log("当前延迟 4~8 秒/个，比较安全");
+    
+    var offset = null;
+    var processed = 0;
+    
+    while (cleaner.running && cleaner.removed < (maxCount || 20)) {
+        var query = encWbi({vmid: cleaner.mid, ps: 50, offset: offset || ""});
+        var resp = await fetch("https://api.bilibili.com/x/relation/fans?" + query, {
+            credentials: "include",
+            headers: { "Referer": "https://space.bilibili.com/" }
+        }).then(function(r){return r.json();});
+        
+        if (resp.code !== 0) {
+            log("请求失败: " + (resp.message || resp.code));
+            if (resp.code === -352) log("触发风控！建议去 https://t.bilibili.com/ 验证后再试");
+            break;
+        }
+        
+        var list = resp.data.list || [];
+        offset = resp.data.offset;
+        
+        for (var i = 0; i < list.length; i++) {
+            var fan = list[i];
+            if (fan.attribute === 6) continue;   // 跳过互粉
+            
+            log("正在移除：" + fan.uname);
+            var result = await fetch("https://api.bilibili.com/x/relation/modify", {
+                method: "POST",
+                body: "fid=" + fan.mid + "&act=7&re_src=11&csrf=" + cleaner.csrf,
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                credentials: "include"
+            }).then(function(r){return r.json();});
+            
+            if (result.code === 0) {
+                cleaner.removed++;
+                log("✓ 移除成功（第 " + cleaner.removed + " 个）");
+            } else {
+                log("✕ 移除失败：" + (result.message || result.code));
+            }
+            
+            await sleep(4000 + Math.random() * 4000);
+            if (!cleaner.running) break;
+        }
+        
+        if (!offset || list.length < 50) break;
+        await sleep(2500);
+    }
+    
+    cleaner.running = false;
+    log("本次清理完成，共移除 " + cleaner.removed + " 个非互粉。");
+    log("建议休息几小时或明天再清理下一批。");
+}
+
+log("使用方法：输入 startCleaning(20)  开始清理（数字为最多清理数量）");
+log("输入 cleaner.running = false 可立即停止");
